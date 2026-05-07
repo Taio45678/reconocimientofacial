@@ -1,40 +1,60 @@
-import React, { useEffect, useRef, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import {
   FaceLandmarker,
   FilesetResolver,
   DrawingUtils,
+  ObjectDetector,
 } from "@mediapipe/tasks-vision";
+
+const OBJECT_MAP = {
+  book: { label: "Cuaderno / libro", type: "directa" },
+  "cell phone": { label: "Celular", type: "directa" },
+  cup: { label: "Mate / vaso", type: "aprox." },
+  bottle: { label: "Termo / botella", type: "aprox." },
+};
+
+const UNSUPPORTED_OBJECTS = ["barbijo", "lente", "lapicera"];
 
 export default function App() {
   const videoRef = useRef(null);
   const canvasRef = useRef(null);
-
-  const landmarkerRef = useRef(null);
+  const faceLandmarkerRef = useRef(null);
+  const objectDetectorRef = useRef(null);
   const drawingUtilsRef = useRef(null);
-
   const animationRef = useRef(null);
   const streamRef = useRef(null);
-
-  const lastUpdateRef = useRef(0);
+  const lastUiUpdateRef = useRef(0);
+  const lastObjectDetectRef = useRef(0);
+  const lastObjectsRef = useRef([]);
 
   const [ready, setReady] = useState(false);
   const [running, setRunning] = useState(false);
-
-  const [status, setStatus] = useState(
-    "Cargando MediaPipe..."
-  );
-
+  const [status, setStatus] = useState("Inicializando módulos IA...");
   const [metrics, setMetrics] = useState({
     faces: 0,
+    emotion: "Sin rostro",
+    emotionScore: 0,
     smile: 0,
-    leftBlink: 0,
-    rightBlink: 0,
+    surprise: 0,
+    blink: 0,
+    focus: 0,
     liveness: 0,
-    skinTone: "Desconocido",
-    hairTone: "Desconocido",
-    emotion: "Neutral",
     verdict: "Sin rostro",
+    objects: [],
   });
+
+  const objectBadges = useMemo(() => {
+    const found = new Set(metrics.objects.map((o) => o.label));
+    return [
+      { label: "Cuaderno", active: [...found].some((x) => x.includes("Cuaderno")) },
+      { label: "Celular", active: [...found].some((x) => x.includes("Celular")) },
+      { label: "Mate", active: [...found].some((x) => x.includes("Mate")) },
+      { label: "Termo", active: [...found].some((x) => x.includes("Termo")) },
+      { label: "Barbijo*", active: false },
+      { label: "Lente*", active: false },
+      { label: "Lapicera*", active: false },
+    ];
+  }, [metrics.objects]);
 
   useEffect(() => {
     let cancelled = false;
@@ -45,47 +65,43 @@ export default function App() {
           "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@latest/wasm"
         );
 
-        const faceLandmarker =
-          await FaceLandmarker.createFromOptions(
-            vision,
-            {
-              baseOptions: {
-                modelAssetPath:
-                  "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/latest/face_landmarker.task",
-                delegate: "GPU",
-              },
-
-              runningMode: "VIDEO",
-
-              numFaces: 1,
-
-              outputFaceBlendshapes: true,
-
-              outputFacialTransformationMatrixes: true,
-            }
-          );
+        const [faceLandmarker, objectDetector] = await Promise.all([
+          FaceLandmarker.createFromOptions(vision, {
+            baseOptions: {
+              modelAssetPath:
+                "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/latest/face_landmarker.task",
+              delegate: "GPU",
+            },
+            runningMode: "VIDEO",
+            numFaces: 1,
+            outputFaceBlendshapes: true,
+            outputFacialTransformationMatrixes: true,
+          }),
+          ObjectDetector.createFromOptions(vision, {
+            baseOptions: {
+              modelAssetPath:
+                "https://storage.googleapis.com/mediapipe-tasks/object_detector/efficientdet_lite0_uint8.tflite",
+              delegate: "GPU",
+            },
+            runningMode: "VIDEO",
+            scoreThreshold: 0.38,
+            maxResults: 8,
+          }),
+        ]);
 
         if (!cancelled) {
-          landmarkerRef.current =
-            faceLandmarker;
-
+          faceLandmarkerRef.current = faceLandmarker;
+          objectDetectorRef.current = objectDetector;
           setReady(true);
-
-          setStatus(
-            "Listo. Iniciá la cámara."
-          );
+          setStatus("Listo. Iniciá la cámara.");
         }
       } catch (error) {
         console.error(error);
-
-        setStatus(
-          "No se pudo cargar MediaPipe."
-        );
+        setStatus("No se pudo cargar MediaPipe. Revisá conexión o consola.");
       }
     }
 
     initMediaPipe();
-
     return () => {
       cancelled = true;
       stopCamera();
@@ -96,631 +112,369 @@ export default function App() {
     try {
       if (!ready) return;
 
-      const stream =
-        await navigator.mediaDevices.getUserMedia({
-          video: {
-            facingMode: "user",
-
-            width: {
-              ideal: 1280,
-            },
-
-            height: {
-              ideal: 720,
-            },
-
-            frameRate: {
-              ideal: 30,
-            },
-          },
-
-          audio: false,
-        });
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: {
+          facingMode: "user",
+          width: { ideal: 1280 },
+          height: { ideal: 720 },
+          frameRate: { ideal: 30, max: 30 },
+        },
+        audio: false,
+      });
 
       streamRef.current = stream;
-
       const video = videoRef.current;
-
       video.srcObject = stream;
-
       await video.play();
 
       const canvas = canvasRef.current;
+      canvas.width = video.videoWidth || 1280;
+      canvas.height = video.videoHeight || 720;
 
-      canvas.width = video.videoWidth;
-      canvas.height = video.videoHeight;
-
-      const ctx = canvas.getContext("2d", {
-        willReadFrequently: true,
-      });
-
-      drawingUtilsRef.current =
-        new DrawingUtils(ctx);
+      const ctx = canvas.getContext("2d", { willReadFrequently: true });
+      drawingUtilsRef.current = new DrawingUtils(ctx);
 
       setRunning(true);
-
-      setStatus(
-        "Cámara activa. Detectando rostro..."
-      );
-
+      setStatus("Escaneo activo: rostro + objetos.");
       predictLoop();
     } catch (error) {
       console.error(error);
-
-      setStatus(
-        "No pude acceder a la cámara."
-      );
+      setStatus("No pude acceder a la cámara. En celular usá HTTPS y aceptá permisos.");
     }
   }
 
   function stopCamera() {
-    if (animationRef.current) {
-      cancelAnimationFrame(
-        animationRef.current
-      );
-
-      animationRef.current = null;
-    }
+    if (animationRef.current) cancelAnimationFrame(animationRef.current);
+    animationRef.current = null;
 
     if (streamRef.current) {
-      streamRef.current
-        .getTracks()
-        .forEach((track) => track.stop());
-
+      streamRef.current.getTracks().forEach((track) => track.stop());
       streamRef.current = null;
     }
 
-    if (videoRef.current) {
-      videoRef.current.srcObject = null;
-    }
-
+    if (videoRef.current) videoRef.current.srcObject = null;
     setRunning(false);
   }
 
-  function getBlendScore(
-    blendshapes,
-    name
-  ) {
-    const item =
-      blendshapes?.categories?.find(
-        (c) => c.categoryName === name
-      );
-
-    return item ? item.score : 0;
+  function blend(blendshapes, name) {
+    return blendshapes?.categories?.find((c) => c.categoryName === name)?.score || 0;
   }
 
-  function classifySkin(r, g, b) {
-    const brightness =
-      (r + g + b) / 3;
+  function classifyEmotion(faceBlend) {
+    const smile = (blend(faceBlend, "mouthSmileLeft") + blend(faceBlend, "mouthSmileRight")) / 2;
+    const frown = (blend(faceBlend, "mouthFrownLeft") + blend(faceBlend, "mouthFrownRight")) / 2;
+    const jawOpen = blend(faceBlend, "jawOpen");
+    const browUp = blend(faceBlend, "browInnerUp");
+    const browDown = (blend(faceBlend, "browDownLeft") + blend(faceBlend, "browDownRight")) / 2;
+    const eyeWide = (blend(faceBlend, "eyeWideLeft") + blend(faceBlend, "eyeWideRight")) / 2;
+    const eyeSquint = (blend(faceBlend, "eyeSquintLeft") + blend(faceBlend, "eyeSquintRight")) / 2;
+    const blinkLeft = blend(faceBlend, "eyeBlinkLeft");
+    const blinkRight = blend(faceBlend, "eyeBlinkRight");
+    const blinkMax = Math.max(blinkLeft, blinkRight);
+    const blinkAvg = (blinkLeft + blinkRight) / 2;
 
-    if (brightness < 55)
-      return "Muy oscura";
+    const scores = [
+      { name: "Feliz", score: smile * 0.78 + eyeSquint * 0.22 },
+      { name: "Sorprendido", score: jawOpen * 0.48 + browUp * 0.32 + eyeWide * 0.2 },
+      { name: "Concentrado", score: browDown * 0.55 + eyeSquint * 0.25 + (1 - jawOpen) * 0.2 },
+      { name: "Serio / neutral", score: Math.max(0.15, 0.55 - smile * 0.35 - jawOpen * 0.2 - browUp * 0.1) },
+      { name: "Posible disgusto", score: frown * 0.55 + browDown * 0.25 + blend(faceBlend, "mouthPressLeft") * 0.1 + blend(faceBlend, "mouthPressRight") * 0.1 },
+    ].sort((a, b) => b.score - a.score);
 
-    if (brightness < 90)
-      return "Oscura";
+    const top = scores[0];
+    const confidence = Math.round(Math.min(100, Math.max(0, top.score * 100)));
 
-    if (brightness < 140)
-      return "Morena";
-
-    if (brightness < 190)
-      return "Clara";
-
-    return "Muy clara";
+    return {
+      emotion: confidence < 28 ? "Indefinida" : top.name,
+      emotionScore: confidence,
+      smile: Math.round(smile * 100),
+      surprise: Math.round((jawOpen * 0.55 + browUp * 0.3 + eyeWide * 0.15) * 100),
+      blink: Math.round(blinkMax * 100),
+      focus: Math.round(Math.min(100, (1 - blinkAvg) * 55 + browDown * 35 + eyeSquint * 10)),
+    };
   }
 
-  function classifyHair(r, g, b) {
-    const brightness =
-      (r + g + b) / 3;
-
-    if (brightness < 50)
-      return "Negro";
-
-    if (brightness < 90)
-      return "Castaño oscuro";
-
-    if (brightness < 140)
-      return "Castaño";
-
-    if (brightness < 190)
-      return "Rubio oscuro";
-
-    return "Rubio";
+  function getTargetObjects(objectResult) {
+    const detections = objectResult?.detections || [];
+    return detections
+      .map((det) => {
+        const cat = det.categories?.[0];
+        const key = cat?.categoryName;
+        if (!key || !OBJECT_MAP[key]) return null;
+        const mapped = OBJECT_MAP[key];
+        return {
+          key,
+          label: mapped.label,
+          type: mapped.type,
+          score: Math.round((cat.score || 0) * 100),
+          box: det.boundingBox,
+        };
+      })
+      .filter(Boolean)
+      .sort((a, b) => b.score - a.score);
   }
 
-  function getAverageColor(
-    ctx,
-    x,
-    y,
-    size = 10
-  ) {
-    try {
-      const data = ctx.getImageData(
-        x,
-        y,
-        size,
-        size
-      ).data;
+  function drawObjectBoxes(ctx, objects) {
+    objects.forEach((obj) => {
+      const box = obj.box;
+      if (!box) return;
+      ctx.save();
+      ctx.strokeStyle = obj.type === "directa" ? "#00f5ff" : "#fcee09";
+      ctx.lineWidth = 3;
+      ctx.shadowColor = ctx.strokeStyle;
+      ctx.shadowBlur = 10;
+      ctx.strokeRect(box.originX, box.originY, box.width, box.height);
 
-      let r = 0;
-      let g = 0;
-      let b = 0;
-      let count = 0;
+      const text = `${obj.label} ${obj.score}% ${obj.type === "aprox." ? "≈" : ""}`;
+      ctx.font = "bold 15px ui-monospace, SFMono-Regular, Menlo, monospace";
+      const w = ctx.measureText(text).width + 14;
+      ctx.fillStyle = "rgba(0,0,0,0.78)";
+      ctx.fillRect(box.originX, Math.max(0, box.originY - 28), w, 24);
+      ctx.fillStyle = ctx.strokeStyle;
+      ctx.fillText(text, box.originX + 7, Math.max(17, box.originY - 10));
+      ctx.restore();
+    });
+  }
 
-      for (
-        let i = 0;
-        i < data.length;
-        i += 4
-      ) {
-        r += data[i];
-        g += data[i + 1];
-        b += data[i + 2];
-        count++;
-      }
+  function drawCyberOverlay(ctx, canvas, nextMetrics) {
+    ctx.save();
+    const grad = ctx.createLinearGradient(0, 0, canvas.width, canvas.height);
+    grad.addColorStop(0, "rgba(0,245,255,0.08)");
+    grad.addColorStop(0.5, "rgba(255,0,128,0.06)");
+    grad.addColorStop(1, "rgba(252,238,9,0.05)");
+    ctx.fillStyle = grad;
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
 
-      return {
-        r: Math.round(r / count),
-        g: Math.round(g / count),
-        b: Math.round(b / count),
-      };
-    } catch {
-      return {
-        r: 0,
-        g: 0,
-        b: 0,
-      };
+    ctx.strokeStyle = "rgba(0,245,255,0.16)";
+    ctx.lineWidth = 1;
+    const step = 64;
+    for (let x = 0; x < canvas.width; x += step) {
+      ctx.beginPath();
+      ctx.moveTo(x, 0);
+      ctx.lineTo(x, canvas.height);
+      ctx.stroke();
     }
+    for (let y = 0; y < canvas.height; y += step) {
+      ctx.beginPath();
+      ctx.moveTo(0, y);
+      ctx.lineTo(canvas.width, y);
+      ctx.stroke();
+    }
+
+    ctx.fillStyle = "rgba(2,6,23,0.72)";
+    ctx.strokeStyle = "rgba(0,245,255,0.55)";
+    ctx.lineWidth = 2;
+    ctx.fillRect(18, 18, 330, 168);
+    ctx.strokeRect(18, 18, 330, 168);
+    ctx.font = "bold 17px ui-monospace, SFMono-Regular, Menlo, monospace";
+    ctx.fillStyle = "#00f5ff";
+    ctx.fillText(`FACE: ${nextMetrics.verdict}`, 34, 50);
+    ctx.fillStyle = "#fcee09";
+    ctx.fillText(`EMOTION: ${nextMetrics.emotion} ${nextMetrics.emotionScore}%`, 34, 82);
+    ctx.fillStyle = "#ff0080";
+    ctx.fillText(`LIVE: ${nextMetrics.liveness}%`, 34, 114);
+    ctx.fillStyle = "#ffffff";
+    ctx.fillText(`OBJ: ${nextMetrics.objects.length}`, 34, 146);
+    ctx.restore();
   }
 
   function predictLoop() {
     const video = videoRef.current;
-
     const canvas = canvasRef.current;
-
-    const faceLandmarker =
-      landmarkerRef.current;
-
-    const drawingUtils =
-      drawingUtilsRef.current;
-
-    const ctx = canvas.getContext("2d", {
-      willReadFrequently: true,
-    });
+    const faceLandmarker = faceLandmarkerRef.current;
+    const objectDetector = objectDetectorRef.current;
+    const drawingUtils = drawingUtilsRef.current;
+    const ctx = canvas.getContext("2d", { willReadFrequently: true });
 
     function render() {
-      if (
-        !video ||
-        !canvas ||
-        !faceLandmarker ||
-        video.readyState < 2
-      ) {
-        animationRef.current =
-          requestAnimationFrame(render);
-
+      if (!video || !canvas || !faceLandmarker || !objectDetector || video.readyState < 2) {
+        animationRef.current = requestAnimationFrame(render);
         return;
       }
 
       const now = performance.now();
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
 
-      ctx.clearRect(
-        0,
-        0,
-        canvas.width,
-        canvas.height
-      );
+      // Sin modo espejo: se dibuja igual que viene de la cámara.
+      ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
 
-      // VIDEO + IA EN UNA SOLA IMAGEN
-      ctx.save();
+      const faceResult = faceLandmarker.detectForVideo(video, now);
 
-      ctx.scale(-1, 1);
+      if (now - lastObjectDetectRef.current > 260) {
+        try {
+          const objectResult = objectDetector.detectForVideo(video, now);
+          lastObjectsRef.current = getTargetObjects(objectResult);
+          lastObjectDetectRef.current = now;
+        } catch (error) {
+          console.warn("Object detection skipped", error);
+        }
+      }
 
-      ctx.drawImage(
-        video,
-        -canvas.width,
-        0,
-        canvas.width,
-        canvas.height
-      );
+      const objects = lastObjectsRef.current;
+      drawObjectBoxes(ctx, objects);
 
-      ctx.restore();
-
-      const result =
-        faceLandmarker.detectForVideo(
-          video,
-          now
-        );
-
-      const faces =
-        result.faceLandmarks?.length || 0;
-
+      const faces = faceResult.faceLandmarks?.length || 0;
       let nextMetrics = {
         faces,
+        emotion: faces ? "Analizando" : "Sin rostro",
+        emotionScore: 0,
         smile: 0,
-        leftBlink: 0,
-        rightBlink: 0,
+        surprise: 0,
+        blink: 0,
+        focus: 0,
         liveness: 0,
-        skinTone: "Desconocido",
-        hairTone: "Desconocido",
-        emotion: "Neutral",
-        verdict: faces
-          ? "Rostro detectado"
-          : "Sin rostro",
+        verdict: faces ? "Rostro detectado" : "Sin rostro",
+        objects,
       };
 
       if (faces > 0) {
-        const landmarks =
-          result.faceLandmarks[0];
+        const landmarks = faceResult.faceLandmarks[0];
+        const faceBlend = faceResult.faceBlendshapes?.[0];
 
-        const blend =
-          result.faceBlendshapes?.[0];
+        drawingUtils.drawConnectors(landmarks, FaceLandmarker.FACE_LANDMARKS_TESSELATION, {
+          color: "rgba(0,245,255,0.18)",
+          lineWidth: 1,
+        });
+        drawingUtils.drawConnectors(landmarks, FaceLandmarker.FACE_LANDMARKS_FACE_OVAL, {
+          color: "#ff0080",
+          lineWidth: 2,
+        });
+        drawingUtils.drawConnectors(landmarks, FaceLandmarker.FACE_LANDMARKS_RIGHT_EYE, {
+          color: "#00f5ff",
+          lineWidth: 2,
+        });
+        drawingUtils.drawConnectors(landmarks, FaceLandmarker.FACE_LANDMARKS_LEFT_EYE, {
+          color: "#00f5ff",
+          lineWidth: 2,
+        });
+        drawingUtils.drawConnectors(landmarks, FaceLandmarker.FACE_LANDMARKS_LIPS, {
+          color: "#fcee09",
+          lineWidth: 2,
+        });
 
-        drawingUtils.drawConnectors(
-          landmarks,
-          FaceLandmarker.FACE_LANDMARKS_TESSELATION,
-          {
-            color:
-              "rgba(0,255,180,0.18)",
-            lineWidth: 1,
-          }
-        );
+        const emotion = classifyEmotion(faceBlend);
+        const dynamicSignal = Math.max(emotion.smile, emotion.blink, emotion.surprise);
+        const liveness = Math.min(100, Math.round(45 + dynamicSignal * 0.55));
 
-        drawingUtils.drawConnectors(
-          landmarks,
-          FaceLandmarker.FACE_LANDMARKS_RIGHT_EYE,
-          {
-            color: "#00ff99",
-            lineWidth: 2,
-          }
-        );
-
-        drawingUtils.drawConnectors(
-          landmarks,
-          FaceLandmarker.FACE_LANDMARKS_LEFT_EYE,
-          {
-            color: "#00ff99",
-            lineWidth: 2,
-          }
-        );
-
-        drawingUtils.drawConnectors(
-          landmarks,
-          FaceLandmarker.FACE_LANDMARKS_LIPS,
-          {
-            color: "#ffcc00",
-            lineWidth: 2,
-          }
-        );
-
-        const smileLeft =
-          getBlendScore(
-            blend,
-            "mouthSmileLeft"
-          );
-
-        const smileRight =
-          getBlendScore(
-            blend,
-            "mouthSmileRight"
-          );
-
-        const blinkLeft =
-          getBlendScore(
-            blend,
-            "eyeBlinkLeft"
-          );
-
-        const blinkRight =
-          getBlendScore(
-            blend,
-            "eyeBlinkRight"
-          );
-
-        const jawOpen =
-          getBlendScore(
-            blend,
-            "jawOpen"
-          );
-
-        const smile =
-          (smileLeft + smileRight) / 2;
-
-        const blink = Math.max(
-          blinkLeft,
-          blinkRight
-        );
-
-        const liveness = Math.min(
-          100,
-          Math.round(
-            45 +
-              smile * 30 +
-              blink * 25
-          )
-        );
-
-        let emotion = "Neutral";
-
-        if (smile > 0.45)
-          emotion = "Feliz";
-
-        if (jawOpen > 0.45)
-          emotion = "Sorprendido";
-
-        // PUNTO DE PIEL
-        const facePoint =
-          landmarks[4];
-
-        // PUNTO DE PELO
-        const hairPoint =
-          landmarks[10];
-
-        const faceX = Math.floor(
-          facePoint.x * canvas.width
-        );
-
-        const faceY = Math.floor(
-          facePoint.y * canvas.height
-        );
-
-        const hairX = Math.floor(
-          hairPoint.x * canvas.width
-        );
-
-        const hairY = Math.floor(
-          hairPoint.y *
-            canvas.height -
-            40
-        );
-
-        const skinColor =
-          getAverageColor(
-            ctx,
-            faceX,
-            faceY,
-            12
-          );
-
-        const hairColor =
-          getAverageColor(
-            ctx,
-            hairX,
-            hairY,
-            12
-          );
-
-        const skinTone =
-          classifySkin(
-            skinColor.r,
-            skinColor.g,
-            skinColor.b
-          );
-
-        const hairTone =
-          classifyHair(
-            hairColor.r,
-            hairColor.g,
-            hairColor.b
-          );
-
-        let verdict =
-          "Rostro detectado";
-
-        if (liveness > 70)
-          verdict =
-            "Prueba de vida probable";
-
-        if (smile > 0.45)
-          verdict =
-            "Sonrisa detectada";
-
-        if (blink > 0.45)
-          verdict =
-            "Parpadeo detectado";
+        let verdict = "Rostro detectado";
+        if (liveness >= 72) verdict = "Vida probable";
+        if (emotion.blink > 45) verdict = "Parpadeo detectado";
+        if (emotion.smile > 45) verdict = "Sonrisa detectada";
 
         nextMetrics = {
           faces,
-
-          smile: Math.round(
-            smile * 100
-          ),
-
-          leftBlink: Math.round(
-            blinkLeft * 100
-          ),
-
-          rightBlink: Math.round(
-            blinkRight * 100
-          ),
-
+          ...emotion,
           liveness,
-
-          skinTone,
-
-          hairTone,
-
-          emotion,
-
           verdict,
+          objects,
         };
-
-        // HUD FUTURISTA
-        ctx.fillStyle =
-          "rgba(0,0,0,0.55)";
-
-        ctx.fillRect(20, 20, 310, 190);
-
-        ctx.strokeStyle =
-          "rgba(0,255,180,0.5)";
-
-        ctx.strokeRect(20, 20, 310, 190);
-
-        ctx.fillStyle = "#00ff99";
-
-        ctx.font =
-          "bold 18px Arial";
-
-        ctx.fillText(
-          `Estado: ${verdict}`,
-          35,
-          50
-        );
-
-        ctx.fillText(
-          `Emoción: ${emotion}`,
-          35,
-          80
-        );
-
-        ctx.fillText(
-          `Piel: ${skinTone}`,
-          35,
-          110
-        );
-
-        ctx.fillText(
-          `Cabello: ${hairTone}`,
-          35,
-          140
-        );
-
-        ctx.fillText(
-          `Liveness: ${liveness}%`,
-          35,
-          170
-        );
       }
 
-      if (
-        now - lastUpdateRef.current >
-        120
-      ) {
+      drawCyberOverlay(ctx, canvas, nextMetrics);
+
+      if (now - lastUiUpdateRef.current > 120) {
         setMetrics(nextMetrics);
-
-        lastUpdateRef.current = now;
+        lastUiUpdateRef.current = now;
       }
 
-      animationRef.current =
-        requestAnimationFrame(render);
+      animationRef.current = requestAnimationFrame(render);
     }
 
     render();
   }
 
   return (
-    <main className="min-h-screen bg-slate-950 text-white flex items-center justify-center p-4 overflow-hidden">
-      <section className="w-full max-w-7xl grid lg:grid-cols-[1.4fr_0.8fr] gap-5">
-        <div className="rounded-3xl overflow-hidden bg-slate-900 shadow-2xl border border-cyan-500/20 relative">
+    <main className="min-h-dvh overflow-hidden bg-[#050816] text-white">
+      <div className="fixed inset-0 bg-[radial-gradient(circle_at_20%_10%,rgba(0,245,255,0.22),transparent_28%),radial-gradient(circle_at_85%_12%,rgba(255,0,128,0.2),transparent_30%),linear-gradient(135deg,#050816,#09021a_55%,#030712)]" />
+      <div className="fixed inset-0 opacity-30 [background-image:linear-gradient(rgba(0,245,255,.15)_1px,transparent_1px),linear-gradient(90deg,rgba(0,245,255,.15)_1px,transparent_1px)] [background-size:42px_42px]" />
 
-          {/* SOLO UN CANVAS */}
-          <canvas
-            ref={canvasRef}
-            className="w-full h-auto block bg-black rounded-3xl"
-          />
+      <section className="relative z-10 min-h-dvh w-full max-w-7xl mx-auto p-3 sm:p-5 grid grid-cols-1 lg:grid-cols-[1.45fr_0.75fr] gap-4 items-center">
+        <div className="relative rounded-[28px] overflow-hidden border border-cyan-300/35 bg-black shadow-[0_0_45px_rgba(0,245,255,.16)] min-h-[58dvh] sm:min-h-0">
+          <canvas ref={canvasRef} className="block w-full h-[62dvh] sm:h-auto object-cover bg-black" />
+          <video ref={videoRef} className="hidden" playsInline muted />
 
-          {/* VIDEO OCULTO */}
-          <video
-            ref={videoRef}
-            className="hidden"
-            playsInline
-            muted
-          />
+          <div className="pointer-events-none absolute inset-0 bg-[repeating-linear-gradient(to_bottom,rgba(255,255,255,.045)_0px,rgba(255,255,255,.045)_1px,transparent_2px,transparent_5px)] mix-blend-overlay" />
+
+          <div className="absolute top-3 left-3 right-3 flex items-center justify-between gap-3">
+            <div className="rounded-full border border-cyan-300/50 bg-black/65 px-3 py-1 text-[10px] sm:text-xs tracking-[0.28em] text-cyan-200 backdrop-blur">
+              CYBER FACE / OBJECT AI
+            </div>
+            <div className={`h-3 w-3 rounded-full ${running ? "bg-cyan-300 shadow-[0_0_18px_#00f5ff]" : "bg-pink-500 shadow-[0_0_18px_#ff0080]"}`} />
+          </div>
 
           {!running && (
-            <div className="absolute inset-0 flex items-center justify-center bg-black/80 text-center p-8">
+            <div className="absolute inset-0 flex items-center justify-center bg-black/78 text-center p-6">
               <div>
-                <h1 className="text-4xl md:text-6xl font-black mb-4 text-cyan-300">
-                  FACE AI
+                <p className="text-cyan-300 tracking-[0.35em] text-xs mb-3">MEDIAPIPE REAL TIME</p>
+                <h1 className="text-5xl sm:text-7xl font-black leading-none text-white [text-shadow:0_0_12px_#00f5ff,0_0_30px_#ff0080]">
+                  FACE<br />SCAN
                 </h1>
-
-                <p className="text-slate-300 max-w-xl text-lg">
-                  Reconocimiento facial
-                  avanzado con MediaPipe.
+                <p className="mt-4 text-slate-300 max-w-md mx-auto text-sm sm:text-base">
+                  Rostro, emoción heurística, prueba de vida y objetos cercanos. Sin modo espejo.
                 </p>
               </div>
             </div>
           )}
         </div>
 
-        <aside className="rounded-3xl bg-slate-900 border border-cyan-500/20 p-6 shadow-2xl">
-          <div className="mb-6">
-            <p className="text-sm uppercase tracking-widest text-cyan-300 mb-2">
-              Estado
-            </p>
-
-            <h2 className="text-3xl font-black">
-              {metrics.verdict}
-            </h2>
-
-            <p className="text-slate-400 mt-2">
-              {status}
-            </p>
+        <aside className="rounded-[28px] border border-pink-400/35 bg-black/62 backdrop-blur p-4 sm:p-6 shadow-[0_0_45px_rgba(255,0,128,.14)]">
+          <div className="mb-5">
+            <p className="text-xs uppercase tracking-[0.35em] text-pink-300 mb-2">Estado</p>
+            <h2 className="text-2xl sm:text-3xl font-black text-white [text-shadow:0_0_14px_#00f5ff]">{metrics.verdict}</h2>
+            <p className="text-cyan-100/70 mt-2 text-sm">{status}</p>
           </div>
 
-          <div className="grid grid-cols-2 gap-3 mb-6">
-            <Metric
-              label="Rostros"
-              value={metrics.faces}
-            />
-
-            <Metric
-              label="Sonrisa"
-              value={`${metrics.smile}%`}
-            />
-
-            <Metric
-              label="Piel"
-              value={metrics.skinTone}
-            />
-
-            <Metric
-              label="Cabello"
-              value={metrics.hairTone}
-            />
+          <div className="grid grid-cols-2 gap-3 mb-5">
+            <Metric label="Rostros" value={metrics.faces} />
+            <Metric label="Emoción" value={`${metrics.emotion} ${metrics.emotionScore}%`} />
+            <Metric label="Sonrisa" value={`${metrics.smile}%`} />
+            <Metric label="Sorpresa" value={`${metrics.surprise}%`} />
+            <Metric label="Parpadeo" value={`${metrics.blink}%`} />
+            <Metric label="Foco" value={`${metrics.focus}%`} />
           </div>
 
-          <div className="mb-6">
+          <div className="rounded-2xl border border-cyan-300/25 bg-slate-950/75 p-4 mb-5">
             <div className="flex justify-between text-sm mb-2">
-              <span className="text-slate-300">
-                Prueba de vida
-              </span>
-
-              <span>
-                {metrics.liveness}%
-              </span>
+              <span className="text-cyan-100/80">Liveness demo</span>
+              <span className="text-yellow-200 font-black">{metrics.liveness}%</span>
             </div>
-
-            <div className="h-3 bg-slate-800 rounded-full overflow-hidden">
-              <div
-                className="h-full bg-cyan-400 transition-all duration-150"
-                style={{
-                  width: `${metrics.liveness}%`,
-                }}
-              />
+            <div className="h-4 rounded-full bg-slate-900 overflow-hidden border border-cyan-300/20">
+              <div className="h-full bg-gradient-to-r from-cyan-300 via-pink-500 to-yellow-300 transition-all duration-150" style={{ width: `${metrics.liveness}%` }} />
             </div>
-
-            <p className="text-sm text-slate-400 mt-4">
-              Emoción detectada:
-            </p>
-
-            <h3 className="text-2xl font-bold text-cyan-300 mt-1">
-              {metrics.emotion}
-            </h3>
           </div>
 
-          <div className="flex gap-3">
-            <button
-              onClick={startCamera}
-              disabled={!ready || running}
-              className="flex-1 rounded-2xl bg-cyan-400 hover:bg-cyan-300 transition-all text-slate-950 font-black px-4 py-3 disabled:opacity-40"
-            >
-              Iniciar
-            </button>
+          <div className="mb-5">
+            <p className="text-xs uppercase tracking-[0.3em] text-yellow-200 mb-3">Objetos objetivo</p>
+            <div className="flex flex-wrap gap-2">
+              {objectBadges.map((item) => (
+                <span key={item.label} className={`rounded-full px-3 py-1 text-xs border ${item.active ? "border-cyan-300 bg-cyan-300/18 text-cyan-100" : "border-slate-700 bg-slate-950/70 text-slate-400"}`}>
+                  {item.label}
+                </span>
+              ))}
+            </div>
+            <div className="mt-3 space-y-2">
+              {metrics.objects.length === 0 ? (
+                <p className="text-sm text-slate-400">Sin objetos objetivo detectados.</p>
+              ) : (
+                metrics.objects.map((o, i) => (
+                  <div key={`${o.label}-${i}`} className="flex justify-between gap-3 rounded-xl border border-slate-800 bg-slate-950/70 px-3 py-2 text-sm">
+                    <span>{o.label} <span className="text-slate-500">{o.type}</span></span>
+                    <b className="text-cyan-200">{o.score}%</b>
+                  </div>
+                ))
+              )}
+            </div>
+            <p className="text-[11px] text-slate-500 mt-3">
+              * Barbijo, lente y lapicera requieren modelo custom para detección real. Este demo detecta book/cell phone/cup/bottle y los traduce a los objetos pedidos cuando corresponde.
+            </p>
+          </div>
 
-            <button
-              onClick={stopCamera}
-              disabled={!running}
-              className="flex-1 rounded-2xl bg-slate-800 hover:bg-slate-700 transition-all text-white font-black px-4 py-3 disabled:opacity-40"
-            >
-              Detener
+          <div className="grid grid-cols-2 gap-3">
+            <button onClick={startCamera} disabled={!ready || running} className="rounded-2xl bg-cyan-300 text-slate-950 font-black px-4 py-4 disabled:opacity-40 active:scale-[.98] shadow-[0_0_24px_rgba(0,245,255,.28)]">
+              INICIAR
+            </button>
+            <button onClick={stopCamera} disabled={!running} className="rounded-2xl bg-pink-500/20 border border-pink-300/45 text-pink-100 font-black px-4 py-4 disabled:opacity-40 active:scale-[.98]">
+              DETENER
             </button>
           </div>
         </aside>
@@ -729,19 +483,11 @@ export default function App() {
   );
 }
 
-function Metric({
-  label,
-  value,
-}) {
+function Metric({ label, value }) {
   return (
-    <div className="rounded-2xl bg-slate-950 border border-slate-800 p-4">
-      <p className="text-xs text-slate-500 uppercase tracking-wider">
-        {label}
-      </p>
-
-      <p className="text-xl font-black mt-1 text-cyan-300 break-words">
-        {value}
-      </p>
+    <div className="rounded-2xl bg-slate-950/80 border border-cyan-300/20 p-3">
+      <p className="text-[10px] text-cyan-100/50 uppercase tracking-[0.22em]">{label}</p>
+      <p className="text-lg sm:text-xl font-black mt-1 text-cyan-100 break-words">{value}</p>
     </div>
   );
 }
