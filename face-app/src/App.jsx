@@ -30,6 +30,9 @@ export default function App() {
     leftBlink: 0,
     rightBlink: 0,
     liveness: 0,
+    skinTone: "Desconocido",
+    hairTone: "Desconocido",
+    emotion: "Neutral",
     verdict: "Sin rostro",
   });
 
@@ -63,12 +66,13 @@ export default function App() {
           );
 
         if (!cancelled) {
-          landmarkerRef.current = faceLandmarker;
+          landmarkerRef.current =
+            faceLandmarker;
 
           setReady(true);
 
           setStatus(
-            "Listo. Tocá iniciar cámara."
+            "Listo. Iniciá la cámara."
           );
         }
       } catch (error) {
@@ -126,7 +130,9 @@ export default function App() {
       canvas.width = video.videoWidth;
       canvas.height = video.videoHeight;
 
-      const ctx = canvas.getContext("2d");
+      const ctx = canvas.getContext("2d", {
+        willReadFrequently: true,
+      });
 
       drawingUtilsRef.current =
         new DrawingUtils(ctx);
@@ -183,6 +189,88 @@ export default function App() {
     return item ? item.score : 0;
   }
 
+  function classifySkin(r, g, b) {
+    const brightness =
+      (r + g + b) / 3;
+
+    if (brightness < 55)
+      return "Muy oscura";
+
+    if (brightness < 90)
+      return "Oscura";
+
+    if (brightness < 140)
+      return "Morena";
+
+    if (brightness < 190)
+      return "Clara";
+
+    return "Muy clara";
+  }
+
+  function classifyHair(r, g, b) {
+    const brightness =
+      (r + g + b) / 3;
+
+    if (brightness < 50)
+      return "Negro";
+
+    if (brightness < 90)
+      return "Castaño oscuro";
+
+    if (brightness < 140)
+      return "Castaño";
+
+    if (brightness < 190)
+      return "Rubio oscuro";
+
+    return "Rubio";
+  }
+
+  function getAverageColor(
+    ctx,
+    x,
+    y,
+    size = 10
+  ) {
+    try {
+      const data = ctx.getImageData(
+        x,
+        y,
+        size,
+        size
+      ).data;
+
+      let r = 0;
+      let g = 0;
+      let b = 0;
+      let count = 0;
+
+      for (
+        let i = 0;
+        i < data.length;
+        i += 4
+      ) {
+        r += data[i];
+        g += data[i + 1];
+        b += data[i + 2];
+        count++;
+      }
+
+      return {
+        r: Math.round(r / count),
+        g: Math.round(g / count),
+        b: Math.round(b / count),
+      };
+    } catch {
+      return {
+        r: 0,
+        g: 0,
+        b: 0,
+      };
+    }
+  }
+
   function predictLoop() {
     const video = videoRef.current;
 
@@ -194,7 +282,9 @@ export default function App() {
     const drawingUtils =
       drawingUtilsRef.current;
 
-    const ctx = canvas.getContext("2d");
+    const ctx = canvas.getContext("2d", {
+      willReadFrequently: true,
+    });
 
     function render() {
       if (
@@ -211,12 +301,6 @@ export default function App() {
 
       const now = performance.now();
 
-      const result =
-        faceLandmarker.detectForVideo(
-          video,
-          now
-        );
-
       ctx.clearRect(
         0,
         0,
@@ -224,20 +308,39 @@ export default function App() {
         canvas.height
       );
 
+      // VIDEO + IA EN UNA SOLA IMAGEN
+      ctx.save();
+
+      ctx.scale(-1, 1);
+
+      ctx.drawImage(
+        video,
+        -canvas.width,
+        0,
+        canvas.width,
+        canvas.height
+      );
+
+      ctx.restore();
+
+      const result =
+        faceLandmarker.detectForVideo(
+          video,
+          now
+        );
+
       const faces =
         result.faceLandmarks?.length || 0;
 
       let nextMetrics = {
         faces,
-
         smile: 0,
-
         leftBlink: 0,
-
         rightBlink: 0,
-
         liveness: 0,
-
+        skinTone: "Desconocido",
+        hairTone: "Desconocido",
+        emotion: "Neutral",
         verdict: faces
           ? "Rostro detectado"
           : "Sin rostro",
@@ -255,8 +358,7 @@ export default function App() {
           FaceLandmarker.FACE_LANDMARKS_TESSELATION,
           {
             color:
-              "rgba(0,255,180,0.20)",
-
+              "rgba(0,255,180,0.18)",
             lineWidth: 1,
           }
         );
@@ -266,7 +368,6 @@ export default function App() {
           FaceLandmarker.FACE_LANDMARKS_RIGHT_EYE,
           {
             color: "#00ff99",
-
             lineWidth: 2,
           }
         );
@@ -276,7 +377,6 @@ export default function App() {
           FaceLandmarker.FACE_LANDMARKS_LEFT_EYE,
           {
             color: "#00ff99",
-
             lineWidth: 2,
           }
         );
@@ -286,7 +386,6 @@ export default function App() {
           FaceLandmarker.FACE_LANDMARKS_LIPS,
           {
             color: "#ffcc00",
-
             lineWidth: 2,
           }
         );
@@ -315,6 +414,12 @@ export default function App() {
             "eyeBlinkRight"
           );
 
+        const jawOpen =
+          getBlendScore(
+            blend,
+            "jawOpen"
+          );
+
         const smile =
           (smileLeft + smileRight) / 2;
 
@@ -326,29 +431,90 @@ export default function App() {
         const liveness = Math.min(
           100,
           Math.round(
-            40 +
-              smile * 35 +
+            45 +
+              smile * 30 +
               blink * 25
           )
         );
 
+        let emotion = "Neutral";
+
+        if (smile > 0.45)
+          emotion = "Feliz";
+
+        if (jawOpen > 0.45)
+          emotion = "Sorprendido";
+
+        // PUNTO DE PIEL
+        const facePoint =
+          landmarks[4];
+
+        // PUNTO DE PELO
+        const hairPoint =
+          landmarks[10];
+
+        const faceX = Math.floor(
+          facePoint.x * canvas.width
+        );
+
+        const faceY = Math.floor(
+          facePoint.y * canvas.height
+        );
+
+        const hairX = Math.floor(
+          hairPoint.x * canvas.width
+        );
+
+        const hairY = Math.floor(
+          hairPoint.y *
+            canvas.height -
+            40
+        );
+
+        const skinColor =
+          getAverageColor(
+            ctx,
+            faceX,
+            faceY,
+            12
+          );
+
+        const hairColor =
+          getAverageColor(
+            ctx,
+            hairX,
+            hairY,
+            12
+          );
+
+        const skinTone =
+          classifySkin(
+            skinColor.r,
+            skinColor.g,
+            skinColor.b
+          );
+
+        const hairTone =
+          classifyHair(
+            hairColor.r,
+            hairColor.g,
+            hairColor.b
+          );
+
         let verdict =
           "Rostro detectado";
 
-        if (liveness >= 70) {
+        if (liveness > 70)
           verdict =
             "Prueba de vida probable";
-        }
 
-        if (smile > 0.45) {
+        if (smile > 0.45)
           verdict =
             "Sonrisa detectada";
-        }
 
-        if (blink > 0.45) {
+        if (blink > 0.45)
           verdict =
             "Parpadeo detectado";
-        }
 
         nextMetrics = {
           faces,
@@ -367,13 +533,65 @@ export default function App() {
 
           liveness,
 
+          skinTone,
+
+          hairTone,
+
+          emotion,
+
           verdict,
         };
+
+        // HUD FUTURISTA
+        ctx.fillStyle =
+          "rgba(0,0,0,0.55)";
+
+        ctx.fillRect(20, 20, 310, 190);
+
+        ctx.strokeStyle =
+          "rgba(0,255,180,0.5)";
+
+        ctx.strokeRect(20, 20, 310, 190);
+
+        ctx.fillStyle = "#00ff99";
+
+        ctx.font =
+          "bold 18px Arial";
+
+        ctx.fillText(
+          `Estado: ${verdict}`,
+          35,
+          50
+        );
+
+        ctx.fillText(
+          `Emoción: ${emotion}`,
+          35,
+          80
+        );
+
+        ctx.fillText(
+          `Piel: ${skinTone}`,
+          35,
+          110
+        );
+
+        ctx.fillText(
+          `Cabello: ${hairTone}`,
+          35,
+          140
+        );
+
+        ctx.fillText(
+          `Liveness: ${liveness}%`,
+          35,
+          170
+        );
       }
 
       if (
         now - lastUpdateRef.current >
-        100
+        120
       ) {
         setMetrics(nextMetrics);
 
@@ -388,46 +606,47 @@ export default function App() {
   }
 
   return (
-    <main className="min-h-screen bg-slate-950 text-white flex items-center justify-center p-4">
-      <section className="w-full max-w-6xl grid lg:grid-cols-[1.4fr_0.8fr] gap-5">
-        <div className="rounded-3xl overflow-hidden bg-slate-900 shadow-2xl border border-slate-800 relative">
-          <div className="relative">
-            <video
-              ref={videoRef}
-              className="w-full h-auto block scale-x-[-1]"
-              playsInline
-              muted
-            />
+    <main className="min-h-screen bg-slate-950 text-white flex items-center justify-center p-4 overflow-hidden">
+      <section className="w-full max-w-7xl grid lg:grid-cols-[1.4fr_0.8fr] gap-5">
+        <div className="rounded-3xl overflow-hidden bg-slate-900 shadow-2xl border border-cyan-500/20 relative">
 
-            <canvas
-              ref={canvasRef}
-              className="absolute inset-0 w-full h-full pointer-events-none scale-x-[-1]"
-            />
-          </div>
+          {/* SOLO UN CANVAS */}
+          <canvas
+            ref={canvasRef}
+            className="w-full h-auto block bg-black rounded-3xl"
+          />
+
+          {/* VIDEO OCULTO */}
+          <video
+            ref={videoRef}
+            className="hidden"
+            playsInline
+            muted
+          />
 
           {!running && (
-            <div className="absolute inset-0 flex items-center justify-center bg-black/70 text-center p-8">
+            <div className="absolute inset-0 flex items-center justify-center bg-black/80 text-center p-8">
               <div>
-                <h1 className="text-3xl md:text-5xl font-bold mb-3">
-                  FaceID Demo
+                <h1 className="text-4xl md:text-6xl font-black mb-4 text-cyan-300">
+                  FACE AI
                 </h1>
 
-                <p className="text-slate-300 max-w-xl">
-                  Detección facial en tiempo
-                  real con MediaPipe.
+                <p className="text-slate-300 max-w-xl text-lg">
+                  Reconocimiento facial
+                  avanzado con MediaPipe.
                 </p>
               </div>
             </div>
           )}
         </div>
 
-        <aside className="rounded-3xl bg-slate-900 border border-slate-800 p-6 shadow-2xl">
+        <aside className="rounded-3xl bg-slate-900 border border-cyan-500/20 p-6 shadow-2xl">
           <div className="mb-6">
             <p className="text-sm uppercase tracking-widest text-cyan-300 mb-2">
               Estado
             </p>
 
-            <h2 className="text-2xl font-bold">
+            <h2 className="text-3xl font-black">
               {metrics.verdict}
             </h2>
 
@@ -448,13 +667,13 @@ export default function App() {
             />
 
             <Metric
-              label="Ojo izq."
-              value={`${metrics.leftBlink}%`}
+              label="Piel"
+              value={metrics.skinTone}
             />
 
             <Metric
-              label="Ojo der."
-              value={`${metrics.rightBlink}%`}
+              label="Cabello"
+              value={metrics.hairTone}
             />
           </div>
 
@@ -478,34 +697,31 @@ export default function App() {
               />
             </div>
 
-            <p className="text-xs text-slate-500 mt-2">
-              Demo educativa.
+            <p className="text-sm text-slate-400 mt-4">
+              Emoción detectada:
             </p>
+
+            <h3 className="text-2xl font-bold text-cyan-300 mt-1">
+              {metrics.emotion}
+            </h3>
           </div>
 
           <div className="flex gap-3">
             <button
               onClick={startCamera}
               disabled={!ready || running}
-              className="flex-1 rounded-2xl bg-cyan-400 text-slate-950 font-bold px-4 py-3 disabled:opacity-40"
+              className="flex-1 rounded-2xl bg-cyan-400 hover:bg-cyan-300 transition-all text-slate-950 font-black px-4 py-3 disabled:opacity-40"
             >
-              Iniciar cámara
+              Iniciar
             </button>
 
             <button
               onClick={stopCamera}
               disabled={!running}
-              className="flex-1 rounded-2xl bg-slate-800 text-white font-bold px-4 py-3 disabled:opacity-40"
+              className="flex-1 rounded-2xl bg-slate-800 hover:bg-slate-700 transition-all text-white font-black px-4 py-3 disabled:opacity-40"
             >
               Detener
             </button>
-          </div>
-
-          <div className="mt-6 text-sm text-slate-400 leading-relaxed">
-            <p>
-              Funciona mejor con buena
-              iluminación y cámara frontal.
-            </p>
           </div>
         </aside>
       </section>
@@ -523,7 +739,7 @@ function Metric({
         {label}
       </p>
 
-      <p className="text-2xl font-bold mt-1">
+      <p className="text-xl font-black mt-1 text-cyan-300 break-words">
         {value}
       </p>
     </div>
