@@ -96,11 +96,11 @@ export default function App() {
             facingMode: "user",
 
             width: {
-              ideal: 1920,
+              ideal: 1280,
             },
 
             height: {
-              ideal: 1080,
+              ideal: 720,
             },
 
             frameRate: {
@@ -157,6 +157,100 @@ export default function App() {
     setRunning(false);
   }
 
+  function getBlendScore(
+    blendshapes,
+    name
+  ) {
+    const item =
+      blendshapes?.categories?.find(
+        (c) => c.categoryName === name
+      );
+
+    return item ? item.score : 0;
+  }
+
+  function classifySkin(r, g, b) {
+    const brightness =
+      (r + g + b) / 3;
+
+    if (brightness < 55)
+      return "Muy oscura";
+
+    if (brightness < 90)
+      return "Oscura";
+
+    if (brightness < 140)
+      return "Morena";
+
+    if (brightness < 190)
+      return "Clara";
+
+    return "Muy clara";
+  }
+
+  function classifyHair(r, g, b) {
+    const brightness =
+      (r + g + b) / 3;
+
+    if (brightness < 50)
+      return "Negro";
+
+    if (brightness < 90)
+      return "Castaño oscuro";
+
+    if (brightness < 140)
+      return "Castaño";
+
+    if (brightness < 190)
+      return "Rubio oscuro";
+
+    return "Rubio";
+  }
+
+  function getAverageColor(
+    ctx,
+    x,
+    y,
+    size = 10
+  ) {
+    try {
+      const data = ctx.getImageData(
+        x,
+        y,
+        size,
+        size
+      ).data;
+
+      let r = 0;
+      let g = 0;
+      let b = 0;
+      let count = 0;
+
+      for (
+        let i = 0;
+        i < data.length;
+        i += 4
+      ) {
+        r += data[i];
+        g += data[i + 1];
+        b += data[i + 2];
+        count++;
+      }
+
+      return {
+        r: Math.round(r / count),
+        g: Math.round(g / count),
+        b: Math.round(b / count),
+      };
+    } catch {
+      return {
+        r: 0,
+        g: 0,
+        b: 0,
+      };
+    }
+  }
+
   function predictLoop() {
     const video = videoRef.current;
 
@@ -198,7 +292,6 @@ export default function App() {
         canvas.height
       );
 
-      // VIDEO
       ctx.drawImage(
         video,
         0,
@@ -207,43 +300,70 @@ export default function App() {
         canvas.height
       );
 
-      // DETECCIÓN OBJETOS
+      // SCANNER FX
+      const scanY =
+        (Date.now() / 4) %
+        canvas.height;
+
+      ctx.fillStyle =
+        "rgba(0,255,255,0.05)";
+
+      ctx.fillRect(
+        0,
+        scanY,
+        canvas.width,
+        3
+      );
+
+      // OBJETOS
       const objects =
         await objectDetector.detect(video);
 
       objects
-        .filter((obj) => obj.score > 0.60)
+        .filter((obj) => obj.score > 0.6)
         .forEach((obj) => {
           const [x, y, w, h] = obj.bbox;
 
           ctx.strokeStyle =
-            "#00ffff";
+            "#00f7ff";
 
           ctx.lineWidth = 3;
 
           ctx.shadowColor =
-            "#00ffff";
+            "#00f7ff";
 
           ctx.shadowBlur = 15;
 
           ctx.strokeRect(x, y, w, h);
 
           ctx.fillStyle =
-            "#00ffff";
+            "rgba(0,0,0,0.75)";
+
+          ctx.fillRect(
+            x,
+            y - 34,
+            180,
+            30
+          );
+
+          ctx.fillStyle =
+            "#00f7ff";
 
           ctx.font =
-            "bold 18px Arial";
+            window.innerWidth < 768
+              ? "bold 12px Arial"
+              : "bold 16px Arial";
 
           ctx.fillText(
-            `${obj.class} ${Math.round(
+            `${obj.class.toUpperCase()} ${Math.round(
               obj.score * 100
             )}%`,
-            x,
-            y - 10
+            x + 10,
+            y - 12
           );
         });
 
-      // DETECCIÓN ROSTRO
+      // ROSTROS
       const result =
         faceLandmarker.detectForVideo(
           video,
@@ -253,45 +373,18 @@ export default function App() {
       const faces =
         result.faceLandmarks || [];
 
-      faces.forEach((landmarks) => {
+      faces.forEach((landmarks, index) => {
+        const blend =
+          result.faceBlendshapes?.[index];
+
         drawingUtils.drawConnectors(
           landmarks,
           FaceLandmarker.FACE_LANDMARKS_TESSELATION,
           {
             color:
-              "rgba(0,255,180,0.22)",
+              "rgba(0,255,180,0.12)",
 
             lineWidth: 1,
-          }
-        );
-
-        drawingUtils.drawConnectors(
-          landmarks,
-          FaceLandmarker.FACE_LANDMARKS_LEFT_EYE,
-          {
-            color: "#00ff99",
-
-            lineWidth: 2,
-          }
-        );
-
-        drawingUtils.drawConnectors(
-          landmarks,
-          FaceLandmarker.FACE_LANDMARKS_RIGHT_EYE,
-          {
-            color: "#00ff99",
-
-            lineWidth: 2,
-          }
-        );
-
-        drawingUtils.drawConnectors(
-          landmarks,
-          FaceLandmarker.FACE_LANDMARKS_LIPS,
-          {
-            color: "#ffcc00",
-
-            lineWidth: 2,
           }
         );
 
@@ -315,21 +408,219 @@ export default function App() {
         const faceHeight =
           maxY - minY;
 
+        // BOX
         ctx.strokeStyle =
-          "#00ff88";
+          "#00ff99";
 
         ctx.lineWidth = 3;
 
         ctx.shadowColor =
-          "#00ff88";
+          "#00ff99";
 
-        ctx.shadowBlur = 20;
+        ctx.shadowBlur = 18;
 
         ctx.strokeRect(
           minX,
           minY,
           faceWidth,
           faceHeight
+        );
+
+        // RADAR
+        ctx.beginPath();
+
+        ctx.arc(
+          maxX + 30,
+          minY + 30,
+          18,
+          0,
+          Math.PI * 2
+        );
+
+        ctx.strokeStyle =
+          "#00ffee";
+
+        ctx.stroke();
+
+        ctx.beginPath();
+
+        ctx.arc(
+          maxX + 30,
+          minY + 30,
+          5,
+          0,
+          Math.PI * 2
+        );
+
+        ctx.fillStyle =
+          "#00ffee";
+
+        ctx.fill();
+
+        // DATOS
+        const smile =
+          (
+            getBlendScore(
+              blend,
+              "mouthSmileLeft"
+            ) +
+            getBlendScore(
+              blend,
+              "mouthSmileRight"
+            )
+          ) / 2;
+
+        const blinkLeft =
+          getBlendScore(
+            blend,
+            "eyeBlinkLeft"
+          );
+
+        const blinkRight =
+          getBlendScore(
+            blend,
+            "eyeBlinkRight"
+          );
+
+        const blinking =
+          blinkLeft > 0.6 ||
+          blinkRight > 0.6;
+
+        let emotion = "Neutral";
+
+        if (smile > 0.45)
+          emotion = "Feliz";
+
+        const facePoint =
+          landmarks[4];
+
+        const hairPoint =
+          landmarks[10];
+
+        const faceX = Math.floor(
+          facePoint.x * canvas.width
+        );
+
+        const faceY = Math.floor(
+          facePoint.y * canvas.height
+        );
+
+        const hairX = Math.floor(
+          hairPoint.x * canvas.width
+        );
+
+        const hairY = Math.floor(
+          hairPoint.y *
+            canvas.height -
+            40
+        );
+
+        const skinColor =
+          getAverageColor(
+            ctx,
+            faceX,
+            faceY,
+            12
+          );
+
+        const hairColor =
+          getAverageColor(
+            ctx,
+            hairX,
+            hairY,
+            12
+          );
+
+        const skinTone =
+          classifySkin(
+            skinColor.r,
+            skinColor.g,
+            skinColor.b
+          );
+
+        const hairTone =
+          classifyHair(
+            hairColor.r,
+            hairColor.g,
+            hairColor.b
+          );
+
+        // HUD
+        const hudWidth =
+          window.innerWidth < 768
+            ? 240
+            : 320;
+
+        const hudHeight =
+          165;
+
+        let hudY =
+          minY - hudHeight - 12;
+
+        if (hudY < 10) {
+          hudY = minY + faceHeight + 12;
+        }
+
+        ctx.fillStyle =
+          "rgba(0,0,0,0.68)";
+
+        ctx.fillRect(
+          minX,
+          hudY,
+          hudWidth,
+          hudHeight
+        );
+
+        ctx.strokeStyle =
+          "#00ffee";
+
+        ctx.lineWidth = 2;
+
+        ctx.strokeRect(
+          minX,
+          hudY,
+          hudWidth,
+          hudHeight
+        );
+
+        ctx.fillStyle =
+          "#00ffee";
+
+        ctx.font =
+          window.innerWidth < 768
+            ? "bold 11px Arial"
+            : "bold 15px Arial";
+
+        const info = [
+          `FACE ID: ${index + 1}`,
+          `EMOCION: ${emotion}`,
+          `PIEL: ${skinTone}`,
+          `CABELLO: ${hairTone}`,
+          `PERSONAS: ${faces.length}`,
+          blinking
+            ? "PARPADEO DETECTADO"
+            : "OJOS ABIERTOS",
+        ];
+
+        info.forEach((line, i) => {
+          ctx.fillText(
+            line,
+            minX + 12,
+            hudY + 24 + i * 22
+          );
+        });
+
+        ctx.fillStyle =
+          blinking
+            ? "#ff4444"
+            : "#00ff88";
+
+        ctx.fillText(
+          blinking
+            ? "LIVE BLINK"
+            : "TRACKING ACTIVE",
+          minX + 12,
+          hudY + hudHeight - 14
         );
       });
 
@@ -341,44 +632,81 @@ export default function App() {
   }
 
   return (
-    <main className="min-h-screen bg-black flex items-center justify-center overflow-hidden">
-      <div className="w-full h-screen relative">
-        <canvas
-          ref={canvasRef}
-          className="w-full h-full object-cover bg-black"
-        />
+    <main className="fixed inset-0 w-screen h-screen overflow-hidden bg-black">
+      {/* FX */}
+      <div
+        className="absolute inset-0 opacity-[0.08] pointer-events-none"
+        style={{
+          backgroundImage:
+            "linear-gradient(rgba(0,255,255,0.15) 1px, transparent 1px), linear-gradient(90deg, rgba(0,255,255,0.15) 1px, transparent 1px)",
+          backgroundSize:
+            "40px 40px",
+        }}
+      />
 
-        <video
-          ref={videoRef}
-          className="hidden"
-          playsInline
-          muted
-        />
+      <canvas
+        ref={canvasRef}
+        className="absolute inset-0 w-full h-full"
+      />
 
-        {!running && (
-          <div className="absolute inset-0 flex items-center justify-center bg-black">
-            <button
-              onClick={startCamera}
-              disabled={!ready}
-              className="
-                px-10
-                py-5
-                rounded-3xl
-                bg-cyan-400
-                hover:bg-cyan-300
-                transition-all
-                text-black
-                font-black
-                text-2xl
-                shadow-2xl
-                disabled:opacity-40
-              "
-            >
-              INICIAR IA
-            </button>
+      <video
+        ref={videoRef}
+        className="hidden"
+        playsInline
+        muted
+      />
+
+      {/* TOP BAR */}
+      <div className="absolute top-0 left-0 w-full flex items-center justify-between px-4 md:px-8 py-4 z-50">
+        <div>
+          <h1 className="text-cyan-300 font-black tracking-[0.25em] text-xs sm:text-sm md:text-xl">
+            FACE AI SYSTEM
+          </h1>
+
+          <p className="text-cyan-100/60 text-[10px] md:text-sm mt-1">
+            Reconocimiento inteligente
+          </p>
+        </div>
+
+        {running && (
+          <div className="flex items-center gap-2 bg-black/40 border border-cyan-400/30 px-3 py-2 rounded-2xl backdrop-blur-md">
+            <div className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
+
+            <span className="text-cyan-200 text-xs md:text-sm font-semibold">
+              LIVE
+            </span>
           </div>
         )}
       </div>
+
+      {/* START */}
+      {!running && (
+        <div className="absolute inset-0 flex items-center justify-center bg-black/80 backdrop-blur-sm z-50">
+          <div className="flex flex-col items-center gap-6 px-8 text-center">
+            <div className="w-28 h-28 rounded-full border-4 border-cyan-400 shadow-[0_0_60px_rgba(0,255,255,0.7)] flex items-center justify-center animate-pulse">
+              <div className="w-16 h-16 rounded-full bg-cyan-400/20 border border-cyan-300" />
+            </div>
+
+            <div>
+              <h1 className="text-4xl sm:text-5xl md:text-7xl font-black text-cyan-300 tracking-[0.2em]">
+                FACE AI
+              </h1>
+
+              <p className="text-cyan-100/70 mt-4 text-sm md:text-lg">
+                Sistema inteligente de reconocimiento facial
+              </p>
+            </div>
+
+            <button
+              onClick={startCamera}
+              disabled={!ready}
+              className="mt-4 px-8 md:px-12 py-4 rounded-3xl bg-cyan-400 hover:bg-cyan-300 active:scale-95 transition-all text-black font-black text-lg md:text-2xl shadow-[0_0_40px_rgba(0,255,255,0.7)] disabled:opacity-40"
+            >
+              INICIAR SISTEMA
+            </button>
+          </div>
+        </div>
+      )}
     </main>
   );
 }
